@@ -1,0 +1,345 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+
+class Gconv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(Gconv, self).__init__()
+        self.src_fc = nn.Linear(in_ch, out_ch)
+        self.msg_fc = nn.Linear(in_ch, out_ch)
+        self.bn = nn.BatchNorm1d(out_ch, affine=True, track_running_stats=True)
+
+    def forward(self, A, source, message):
+        src = self.src_fc(source)
+        msg = self.msg_fc(message)
+
+        gen = torch.bmm(A, F.leaky_relu(msg, negative_slope=0.2)) + F.leaky_relu(src, negative_slope=0.2)
+
+        return self.bn(gen.permute(0, 2, 1)).permute(0, 2, 1)
+
+
+class GNN(nn.Module):
+    def __init__(self, channel):
+        super(GNN, self).__init__()
+        self.channel = channel
+        self.gcn_cross = Gconv(in_ch=channel, out_ch=channel)
+        self.gcn_self = Gconv(in_ch=channel, out_ch=channel)
+
+    @staticmethod
+    def build_graph(src, tgt):
+        """
+        src -> (b,wh,c)
+        tgt -> (b,wh,c)
+        """
+        with torch.no_grad():
+            graph = src.bmm(tgt.permute(0, 2, 1))
+            graph = F.softmax(graph, dim=-1)
+            graph = F.normalize(graph, p=1, dim=-2)
+
+        return graph
+
+    def forward(self, skt, ref):
+        b, c, h, w = skt.size()
+        skt = skt.view(b, c, h * w).permute(0, 2, 1)
+        ref = ref.view(b, c, h * w).permute(0, 2, 1)
+        sr = self.build_graph(src=skt, tgt=ref)
+
+        gen = self.gcn_cross(A=sr, source=skt, message=ref) + skt
+
+        gg = self.build_graph(src=gen, tgt=gen)
+
+        ggen = self.gcn_self(A=gg, source=gen, message=gen) + gen
+
+        return ggen
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResBlock, self).__init__()
+
+        def block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            layers += [nn.ReLU(True)]
+            layers += [nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        self.block_1 = block(in_channels, out_channels)
+        self.block_2 = block(out_channels, out_channels)
+        self.block_3 = block(out_channels, out_channels)
+        self.block_4 = block(out_channels, out_channels)
+
+        self.relu = nn.ReLU(True)
+
+    def forward(self, x):
+
+        residual = x
+        out = self.block_1(x)
+        out += residual
+        out = self.relu(out)
+
+        residual = out
+        out = self.block_2(out)
+        out += residual
+        out = self.relu(out)
+
+        residual = out
+        out = self.block_3(out)
+        out += residual
+        out = self.relu(out)
+
+        residual = out
+        out = self.block_4(out)
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels=3):
+        super(Encoder, self).__init__()
+
+        def CL2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            layers += [nn.LeakyReLU(0.2, inplace=False)]
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        # conv_layer
+        self.conv_1 = CL2d(in_channels, 16)           # 256
+        self.conv_2 = CL2d(16, 16)                    # 256
+        self.conv_3 = CL2d(16, 32, stride=2)          # 128
+        self.conv_4 = CL2d(32, 32)                    # 128
+        self.conv_5 = CL2d(32, 64, stride=2)          # 64
+        self.conv_6 = CL2d(64, 64)                    # 64
+        self.conv_7 = CL2d(64, 128, stride=2)         # 32
+        self.conv_8 = CL2d(128, 128)                  # 32
+        self.conv_9 = CL2d(128, 256, stride=2)        # 16
+        self.conv_10 = CL2d(256, 256)                 # 16
+
+        # down_sample_layer
+        self.down_sampling = nn.AdaptiveAvgPool2d((16, 16))
+
+
+    def forward(self, x):
+        f1 = self.conv_1(x)
+        f2 = self.conv_2(f1)
+        f3 = self.conv_3(f2)
+        f4 = self.conv_4(f3)
+        f5 = self.conv_5(f4)
+        f6 = self.conv_6(f5)
+        f7 = self.conv_7(f6)
+        f8 = self.conv_8(f7)
+        f9 = self.conv_9(f8)
+        f10 = self.conv_10(f9)
+
+        F = [f9, f8, f7, f6, f5, f4, f3, f2, f1]
+
+        v1 = self.down_sampling(f1)
+        v2 = self.down_sampling(f2)
+        v3 = self.down_sampling(f3)
+        v4 = self.down_sampling(f4)
+        v5 = self.down_sampling(f5)
+        v6 = self.down_sampling(f6)
+        v7 = self.down_sampling(f7)
+        v8 = self.down_sampling(f8)
+
+        V = torch.cat([v1, v2, v3, v4, v5, v6, v7, v8, f9, f10], dim=1)
+        # h, w = V.size(2), V.size(3)
+        # V = V.view(V.size(0), V.size(1), h*w)
+        # V = torch.permute(V, [0, 2, 1])
+
+        # return V, F, (h, w)
+        return V, F
+
+
+class UnetDecoder(nn.Module):
+    def __init__(self):
+        super(UnetDecoder, self).__init__()
+
+        def CBR2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+            layers = []
+            layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)]
+            layers += [nn.BatchNorm2d(num_features=out_channels)]
+            layers += [nn.LeakyReLU(0.2, inplace=False)]
+
+            cbr = nn.Sequential(*layers)
+
+            return cbr
+
+        self.dec_5_2 = CBR2d(in_channels=992+992, out_channels=256)        # 992+992，  992
+        self.dec_5_1 = CBR2d(in_channels=256+256, out_channels=256)        # 992+256，  624
+        self.uppool_4 = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        self.dec_4_2 = CBR2d(in_channels=256+128, out_channels=128)        # 624+128，  376
+        self.dec_4_1 = CBR2d(in_channels=128+128, out_channels=128)        # 376+128，  252
+        self.uppool_3 = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        self.dec_3_2 = CBR2d(in_channels=128+64, out_channels=64)          # 252+64，   158
+        self.dec_3_1 = CBR2d(in_channels=64+64, out_channels=64)           # 158+64，   111
+        self.uppool_2 = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        self.dec_2_2 = CBR2d(in_channels=64+32, out_channels=32)           # 111+32     72  
+        self.dec_2_1 = CBR2d(in_channels=32+32, out_channels=32)
+        self.uppool_1 = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        self.dec_1_2 = CBR2d(in_channels=32+16, out_channels=16)
+        self.dec_1_1 = CBR2d(in_channels=16+16, out_channels=16)
+
+        self.fc = nn.Conv2d(in_channels=16, out_channels=3, kernel_size=1, stride=1, padding=0, bias=True)
+
+    def forward(self, x, F):
+        # x: [b, 992+992, 16, 16]
+        dec_5_2 = self.dec_5_2(x)                                    # [b, 256, 16, 16]
+        dec_5_1 = self.dec_5_1(torch.cat([dec_5_2, F[0]], dim=1))    # [b, 256, 16, 16]
+        uppool_4 = self.uppool_4(dec_5_1)                            # [b, 256, 32, 32]
+
+        dec_4_2 = self.dec_4_2(torch.cat([uppool_4, F[1]], dim=1))   # [b, 128, 32, 32]
+        dec_4_1 = self.dec_4_1(torch.cat([dec_4_2, F[2]], dim=1))    # [b, 128, 32, 32]
+        uppool_3 = self.uppool_3(dec_4_1)                            # [b, 128, 64, 64]
+
+        dec_3_2 = self.dec_3_2(torch.cat([uppool_3, F[3]], dim=1))   # [b, 64, 64, 64]
+        dec_3_1 = self.dec_3_1(torch.cat([dec_3_2, F[4]], dim=1))    # [b ,64, 64, 64]
+        uppool_2 = self.uppool_2(dec_3_1)                            # [b ,64, 128, 128]
+
+        dec_2_2 = self.dec_2_2(torch.cat([uppool_2, F[5]], dim=1))   # [b ,32, 128, 128]
+        dec_2_1 = self.dec_2_1(torch.cat([dec_2_2, F[6]], dim=1))    # [b ,32, 128, 128]
+        uppool_1 = self.uppool_1(dec_2_1)                            # [b ,32, 256, 256]
+
+        dec_1_2 = self.dec_1_2(torch.cat([uppool_1, F[7]], dim=1))   # [b ,16, 256, 256]
+        dec_1_1 = self.dec_1_1(torch.cat([dec_1_2, F[8]], dim=1))    # [b ,16, 256, 256]
+
+        x = self.fc(dec_1_1)
+        x = nn.Tanh()(x)
+
+        return x
+
+
+# class SGA(nn.Module):
+#     def __init__(self, dv=992):
+#         super(SGA, self).__init__()
+
+#         self.w_Vs = nn.Linear(dv, dv)        # [B, 256, 992]
+#         self.w_Vr = nn.Linear(dv, dv)        # [B, 256, 992]
+#         self.w_Vf_x = nn.Linear(dv, dv)      # [B, 256, 992]
+#         self.w_Vf_y = nn.Linear(dv, dv)      # [B, 256, 992]
+#         self.bn = nn.BatchNorm1d(num_features=992)
+#         self.leak = nn.LeakyReLU(0.2)
+
+#     def forward(self, Vs, Vr, shape):
+#         # Vs Vr [B, 256, 992]
+#         h, w = shape
+#         # cross attention
+#         Vs_residual = Vs
+#         attn_graph = self.get_attn_graph(Vs, Vr)
+#         Vs = self.w_Vs(Vs)
+#         Vs = self.leak(Vs)
+#         Vr = self.w_Vr(Vr)
+#         Vr = self.leak(Vr)
+#         Vf = torch.add(torch.matmul(attn_graph, Vr), Vs)
+#         Vf = self.bn(Vf.permute(0, 2, 1)).permute(0, 2, 1)
+#         Vf = Vf + Vs_residual
+
+#         # self attention
+#         Vf_residual = Vf
+#         attn_graph = self.get_attn_graph(Vf, Vf)
+#         Vf_x = self.w_Vf_x(Vf)
+#         Vf_x = self.leak(Vf_x)
+#         Vf_y = self.w_Vf_y(Vf)
+#         Vf_y = self.leak(Vf_y)
+#         Vg = torch.add(torch.matmul(attn_graph, Vf_y), Vf_x)
+#         Vg = self.bn(Vg.permute(0, 2, 1)).permute(0, 2, 1)
+#         Vg = Vg + Vf_residual
+
+#         Vg = torch.permute(Vg, [0, 2, 1])
+#         Vg = Vg.view(Vg.size(0), Vg.size(1), h, w)
+
+#         return Vg
+
+#     def get_attn_graph(self, Vs, Vr):
+#         """
+#             Compute 'Scaled Dot Product Attention' with double norm
+#         """
+#         with torch.no_grad():
+#             # scores = torch.matmul(query, key.permute(0, 2, 1)) / math.sqrt(d_k)
+#             scores = torch.matmul(Vs, Vr.permute(0, 2, 1))
+#             attn_graph = F.softmax(scores, dim=-1)
+#             attn_graph = F.normalize(attn_graph, p=1, dim=-2)
+
+#         return attn_graph
+
+
+class Generator_SGA(nn.Module):
+    def __init__(self, sketch_channels=1, reference_channels=3):
+        super(Generator_SGA, self).__init__()
+        self.encoder_sketch = Encoder(sketch_channels)
+        self.encoder_reference = Encoder(reference_channels)
+        # self.sga = SGA()
+        self.gnn = GNN(channel=992)
+        self.res_block = ResBlock(992, 992)
+        self.unet_decoder = UnetDecoder()
+
+    def forward(self, sketch_img, reference_img):
+        # Vs, F, shape = self.encoder_sketch(sketch_img)
+        # Vr, _, _ = self.encoder_reference(reference_img)
+        Vs, F = self.encoder_sketch(sketch_img)
+        Vr, _ = self.encoder_reference(reference_img)
+        b, c, h, w = Vr.size()
+        # g = self.sga(Vs, Vr, shape)
+        g = self.gnn(skt=Vs, ref=Vr).view(b, h, w, c).permute(0, 3, 1, 2)
+        g_out = self.res_block(g)
+        img_gen = self.unet_decoder(torch.cat([g, g_out], dim=1), F)
+
+        return img_gen
+
+
+class Discriminator(nn.Module):
+    # LSGAN + SN
+    def __init__(self, ndf, in_channels):
+        super(Discriminator, self).__init__()
+        self.layer_1 = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_channels=in_channels, out_channels=ndf, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.BatchNorm2d(ndf),
+            nn.LeakyReLU(0.2, inplace=False)
+        )
+
+        self.layer_2 = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_channels=ndf, out_channels=ndf*2, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.BatchNorm2d(ndf*2),
+            nn.LeakyReLU(0.2, inplace=False)
+        )
+
+        self.layer_3 = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_channels=ndf*2, out_channels=ndf*4, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.BatchNorm2d(ndf*4),
+            nn.LeakyReLU(0.2, inplace=False)
+        )
+
+        self.layer_4 = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_channels=ndf*4, out_channels=ndf*8, kernel_size=4, stride=2, padding=1, bias=False)),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=False)
+        )
+
+        self.layer_5 = nn.Sequential(
+            nn.Conv2d(in_channels=ndf*8, out_channels=1, kernel_size=4, stride=1, padding=0, bias=False)
+        )
+
+
+    def forward(self, x):
+        out = self.layer_1(x)
+        out = self.layer_2(out)
+        out = self.layer_3(out)
+        out = self.layer_4(out)
+        out = self.layer_5(out)
+        return out
+
